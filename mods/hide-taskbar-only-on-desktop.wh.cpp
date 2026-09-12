@@ -2,7 +2,7 @@
 // @id              hide-taskbar-only-on-desktop
 // @name            Hide Taskbar Only on Desktop
 // @description     Hides selected taskbars while their displays show only the desktop
-// @version         5.9.0
+// @version         6.0.0
 // @author          Sahil Dashoni
 // @github          https://github.com/Sahil-Dashoni
 // @include         windhawk.exe
@@ -79,7 +79,7 @@ The mod uses `WS_EX_LAYERED` with `SetLayeredWindowAttributes` and alpha 0 to hi
 
 Before hiding a taskbar, the mod records the relevant original extended-window style and layered-window attributes on the taskbar itself. An ownership marker identifies taskbars whose transparency was applied by this mod.
 
-If a taskbar is recreated, the new taskbar is rediscovered and evaluated again. If the dedicated tool process is restarted after an unexpected termination, a new instance can reclaim taskbars still carrying the ownership marker. If another component removes `WS_EX_LAYERED` while the mod still has ownership, the stale ownership data is discarded so the current taskbar state can be captured again safely on a later hide.
+If a taskbar is recreated, the new taskbar is rediscovered and evaluated again. If the dedicated tool process is restarted after an unexpected termination, a new instance can reclaim taskbars still carrying the ownership marker. If another component removes `WS_EX_LAYERED` while the mod still has ownership, the stale ownership data is discarded safely and the mod-owned `WS_EX_LAYERED`/`WS_EX_TRANSPARENT` bits are reconciled before a later hide recaptures the current taskbar state. Restoring a taskbar changes only the extended-style bits owned by this mod; unrelated extended-style changes are preserved.
 
 ## Multi-Monitor Behavior
 
@@ -89,13 +89,15 @@ An application spanning multiple displays keeps the taskbars on every intersecte
 
 The mod supports up to 16 display/taskbar entries and uses the current logical display numbering reported by monitor enumeration.
 
+## Fullscreen and Multi-Monitor State
+
+Borderless fullscreen content is tracked as a sticky session for the display that owns it. The fullscreen test accepts borderless windows even when they retain a normal overlapped window style; it uses the exact monitor rectangle (within a small tolerance), the absence of a caption and resize frame, and explicit exclusion of Windows shell, desktop, and taskbar windows. It does not require WS_POPUP.
+
+Once a fullscreen window enters the foreground, its HMONITOR remains associated with that fullscreen owner while focus moves between displays. Normal desktop/taskbar/shell transitions, transient hide or cloak notifications, and the ordinary safety refresh do not invalidate that ownership. The session ends only when the owner explicitly leaves fullscreen while foreground, completes a real minimize, is destroyed, or moves to another monitor. This keeps a secondary-display desktop click from exposing the primary taskbar while fullscreen content remains active.
+
 ## Performance and Refreshing
 
-The full application and display scan runs in the dedicated tool process rather than inside Explorer. Fullscreen state is cached by the actual HMONITOR only after an actual fullscreen window has entered the foreground, avoiding false positives from unrelated borderless background windows and preventing monitor-enumeration changes from moving fullscreen ownership to another display.
-
-Fullscreen state is retained while the cached fullscreen window remains the last fullscreen owner of its monitor, even when focus moves to another display or a transient minimize event is reported. A normal application becoming foreground on that same monitor clears the cached fullscreen owner. Desktop and taskbar foreground transitions on another monitor do not clear it.
-
-The mod uses:
+The full application and display scan runs in the dedicated tool process rather than inside Explorer. The mod uses:
 
 - A dedicated worker thread for state management
 - A lightweight cursor-sampling thread for hover detection
@@ -107,21 +109,6 @@ The 2 second safety poll is intentionally retained as a fallback and does not re
 
 When no displays are configured for desktop-based hiding, the mod skips the application and shell-popup scans and restores any taskbars that may still be hidden by an earlier configuration.
 
-## Known Fullscreen Multi-Monitor Issue
-
-There is currently an unresolved edge case involving a fullscreen window on the primary display and interaction with a secondary display. The intended behavior is that the primary taskbar remains hidden for as long as the primary display is still owned by a tracked fullscreen window, even when focus or mouse interaction moves to another display.
-
-The reproducible failure pattern is:
-
-1. Start a borderless/monitor-sized fullscreen application on the primary display.
-2. Move the cursor to the secondary display.
-3. Click the secondary display's desktop before interacting with its taskbar.
-4. The primary taskbar can incorrectly become visible, even though the fullscreen application is still active on the primary display.
-
-A closely related sequence is that interacting with the secondary taskbar first can leave the primary taskbar correctly hidden, while clicking the secondary desktop first can expose the bug. The problem is predominantly observed with the primary display; equivalent fullscreen behavior on the secondary display generally behaves correctly.
-
-The current implementation already keeps fullscreen ownership associated with the actual `HMONITOR`, caches fullscreen only after the fullscreen window becomes foreground, avoids clearing the cache for ordinary transient shell-focus/minimize-start transitions, and avoids changing the existing shell-interaction classification. Despite those protections, the edge case remains unresolved and needs a more fundamental state-transition analysis rather than another superficial fullscreen check.
-
 ## Limitations
 
 - Desktop-based hiding and hover reveal are supported only for bottom-docked taskbars.
@@ -132,6 +119,7 @@ The current implementation already keeps fullscreen ownership associated with th
 - Because the taskbar is made fully transparent, flashing taskbar buttons and tray notifications are not visually available while that taskbar is hidden by the mod.
 - If the dedicated tool process is terminated unexpectedly, a taskbar may remain invisible and click-through until the mod is started again or the taskbar is otherwise recreated; the next mod instance can reclaim marked taskbars.
 - Other taskbar transparency/customization mods that modify the same taskbar window can conflict with this mod.
+- Borderless fullscreen detection intentionally treats a visible, monitor-sized, captionless and non-resizable application as fullscreen; unusual applications with that exact window presentation may therefore keep their taskbar hidden.
 - Windows shell window classes and processes can change between Windows releases, so shell-interaction detection may need updates for future Windows versions.
 
 */
@@ -300,6 +288,9 @@ constexpr wchar_t kTaskbarOriginalLayeredFlagsProp[] =
 constexpr wchar_t kTaskbarOriginalLayeredAttributesValidProp[] =
     L"windhawk-hide-taskbar-only-on-desktop-original-layered-valid";
 
+constexpr LONG_PTR kModTaskbarExStyleBits =
+    WS_EX_LAYERED | WS_EX_TRANSPARENT;
+
 bool GetWindowUlongPtrProp(
     HWND hwnd,
     const wchar_t* name,
@@ -343,6 +334,61 @@ void RemoveTaskbarOwnershipProperties(HWND hwnd) {
     RemovePropW(hwnd, kTaskbarOriginalLayeredAttributesValidProp);
 }
 
+bool DropStaleTaskbarOwnership(
+    HWND hwnd,
+    LONG_PTR currentExStyle
+) {
+    if (!hwnd) {
+        return false;
+    }
+
+    LONG_PTR restoredExStyle =
+        currentExStyle & ~kModTaskbarExStyleBits;
+
+    ULONG_PTR savedExStyleValue = 0;
+    if (GetWindowUlongPtrProp(
+            hwnd,
+            kTaskbarOriginalExStyleProp,
+            &savedExStyleValue)) {
+        const LONG_PTR savedExStyle =
+            static_cast<LONG_PTR>(savedExStyleValue);
+        restoredExStyle |=
+            savedExStyle & kModTaskbarExStyleBits;
+    }
+
+    if (restoredExStyle != currentExStyle) {
+        SetLastError(ERROR_SUCCESS);
+        LONG_PTR previousExStyle = SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            restoredExStyle
+        );
+        if (previousExStyle == 0 && GetLastError() != ERROR_SUCCESS) {
+            Wh_Log(
+                L"SetWindowLongPtrW(drop stale taskbar ownership) failed for 0x%p: %lu",
+                hwnd,
+                GetLastError()
+            );
+            return false;
+        }
+
+        SetWindowPos(
+            hwnd,
+            nullptr,
+            0, 0, 0, 0,
+            SWP_NOMOVE |
+            SWP_NOSIZE |
+            SWP_NOZORDER |
+            SWP_NOACTIVATE |
+            SWP_FRAMECHANGED |
+            SWP_ASYNCWINDOWPOS
+        );
+    }
+
+    RemoveTaskbarOwnershipProperties(hwnd);
+    return true;
+}
+
 bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
     if (!hwnd || !IsWindow(hwnd)) {
         return false;
@@ -355,16 +401,25 @@ bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
     }
 
     if (hide) {
-        // If another component removed WS_EX_LAYERED while this mod still had
-        // ownership, the saved properties no longer describe the current window
-        // state. Drop the stale ownership and recapture the current state below.
-        if (GetPropW(hwnd, kTaskbarOwnershipProp) != nullptr &&
-            (exStyle & WS_EX_LAYERED) != 0) {
-            return SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA) != 0;
-        }
+        const bool ownedByMod =
+            GetPropW(hwnd, kTaskbarOwnershipProp) != nullptr;
 
-        if (GetPropW(hwnd, kTaskbarOwnershipProp) != nullptr) {
-            RemoveTaskbarOwnershipProperties(hwnd);
+        // If another component removed WS_EX_LAYERED while this mod still had
+        // ownership, discard the stale state and remove only the extended-style
+        // bits controlled by this mod. The current taskbar state can then be
+        // captured cleanly for a new hide operation below.
+        if (ownedByMod && (exStyle & WS_EX_LAYERED) == 0) {
+            if (!DropStaleTaskbarOwnership(hwnd, exStyle)) {
+                return false;
+            }
+
+            SetLastError(ERROR_SUCCESS);
+            exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if (exStyle == 0 && GetLastError() != ERROR_SUCCESS) {
+                return false;
+            }
+        } else if (ownedByMod) {
+            return SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA) != 0;
         }
 
         COLORREF colorKey = 0;
@@ -438,6 +493,17 @@ bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
         if (!SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA)) {
             // Restore the original style if applying the hiding operation failed.
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle);
+            SetWindowPos(
+                hwnd,
+                nullptr,
+                0, 0, 0, 0,
+                SWP_NOMOVE |
+                SWP_NOSIZE |
+                SWP_NOZORDER |
+                SWP_NOACTIVATE |
+                SWP_FRAMECHANGED |
+                SWP_ASYNCWINDOWPOS
+            );
             RemoveTaskbarOwnershipProperties(hwnd);
             Wh_Log(
                 L"SetLayeredWindowAttributes(alpha=0) failed for 0x%p: %lu",
@@ -464,6 +530,12 @@ bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
 
     if (GetPropW(hwnd, kTaskbarOwnershipProp) == nullptr) {
         return false;
+    }
+
+    if ((exStyle & WS_EX_LAYERED) == 0) {
+        // The mod no longer has a layered taskbar to restore from. Drop the
+        // stale ownership without leaving its click-through bit behind.
+        return DropStaleTaskbarOwnership(hwnd, exStyle);
     }
 
     ULONG_PTR originalExStyleValue = 0;
@@ -553,9 +625,6 @@ bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
         return false;
     }
 
-    constexpr LONG_PTR kModExStyleBits =
-        WS_EX_LAYERED | WS_EX_TRANSPARENT;
-
     SetLastError(ERROR_SUCCESS);
     LONG_PTR currentExStyle = GetWindowLongPtrW(
         hwnd,
@@ -568,8 +637,8 @@ bool MakeTaskbarTransparent(HWND hwnd, bool hide) {
     LONG_PTR previousExStyle = SetWindowLongPtrW(
         hwnd,
         GWL_EXSTYLE,
-        (currentExStyle & ~kModExStyleBits) |
-        (originalExStyle & kModExStyleBits)
+        (currentExStyle & ~kModTaskbarExStyleBits) |
+        (originalExStyle & kModTaskbarExStyleBits)
     );
     if (previousExStyle == 0 && GetLastError() != ERROR_SUCCESS) {
         Wh_Log(
@@ -616,8 +685,8 @@ ULONGLONG g_lastMinimizeEventTick = 0;
 bool g_ignoreTaskbarForegroundAfterMinimize = false;
 // A fullscreen window is cached only after that window has actually entered
 // the foreground. The cache is keyed by the HMONITOR itself rather than by
-// monitor-enumeration index, so a shell/foreground transition cannot move the
-// fullscreen owner to a different display.
+// monitor-enumeration index. Once claimed, ownership is sticky until an explicit
+// fullscreen lifecycle event ends it.
 struct FullscreenMonitorOwner {
     HMONITOR monitor;
     HWND hwnd;
@@ -1081,13 +1150,34 @@ struct ScanContext {
     WindowScanResult* result;
 };
 
+bool IsTaskbarWindow(HWND hwnd);
+
 bool IsFullscreenWindowForMonitor(
     HWND hwnd,
     const MonitorEntry& monitorEntry
 ) {
     if (
         !hwnd ||
-        !IsWindow(hwnd)
+        !IsWindow(hwnd) ||
+        !IsWindowVisible(hwnd) ||
+        IsIconic(hwnd)
+    ) {
+        return false;
+    }
+
+    WCHAR className[256] = {};
+    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) == 0) {
+        return false;
+    }
+
+    // Desktop, shell chrome, shell surfaces, and taskbars can also be monitor
+    // sized and borderless. They must never become fullscreen owners merely
+    // because their geometry happens to match a monitor.
+    if (
+        IsDesktopInfrastructureWindow(hwnd, className) ||
+        IsShellChromeClass(className) ||
+        IsShellSurfaceWindow(hwnd, className) ||
+        IsTaskbarWindow(hwnd)
     ) {
         return false;
     }
@@ -1098,8 +1188,11 @@ bool IsFullscreenWindowForMonitor(
             GWL_STYLE
         );
 
+    // Do not require WS_POPUP here. Chromium/Edge-style borderless fullscreen
+    // windows can retain a normal overlapped style while removing the caption
+    // and resize frame. The authoritative signal for this mod is an exact
+    // monitor-sized rectangle together with the absence of caption/frame.
     if (
-        (style & WS_POPUP) == 0 ||
         (style & WS_CAPTION) != 0 ||
         (style & WS_THICKFRAME) != 0
     ) {
@@ -1142,13 +1235,37 @@ int FindFullscreenOwnerIndex(HMONITOR monitor) {
     return -1;
 }
 
+bool IsFullscreenOwnerOnSameMonitor(HWND hwnd, HMONITOR monitor) {
+    if (!hwnd || !IsWindow(hwnd) || !monitor) {
+        return false;
+    }
+
+    return MonitorFromWindow(
+        hwnd,
+        MONITOR_DEFAULTTONEAREST
+    ) == monitor;
+}
+
 bool IsMonitorFullscreenCached(HMONITOR monitor) {
     const int index = FindFullscreenOwnerIndex(monitor);
 
-    return
-        index >= 0 &&
-        g_fullscreenOwners[index].hwnd != nullptr &&
-        IsWindow(g_fullscreenOwners[index].hwnd);
+    if (index < 0 || !g_fullscreenOwners[index].hwnd) {
+        return false;
+    }
+
+    // This is deliberately a pure ownership query. Do not validate fullscreen
+    // geometry here: this function is called during the ordinary taskbar scan,
+    // including shell transitions on another monitor. Windows can transiently
+    // change a fullscreen window's visibility/geometry during those transitions.
+    // The owner is retired only by explicit fullscreen lifecycle events below.
+    HWND owner = g_fullscreenOwners[index].hwnd;
+
+    if (!IsFullscreenOwnerOnSameMonitor(owner, monitor)) {
+        g_fullscreenOwners[index] = {};
+        return false;
+    }
+
+    return true;
 }
 
 void SetFullscreenOwner(HMONITOR monitor, HWND hwnd) {
@@ -1185,31 +1302,73 @@ void ClearFullscreenOwnersForWindow(HWND hwnd) {
     }
 }
 
+void ValidateFullscreenOwnerForMonitor(
+    HMONITOR monitor,
+    const MonitorList& monitors
+) {
+    const int index = FindFullscreenOwnerIndex(monitor);
+    if (index < 0 || !g_fullscreenOwners[index].hwnd) {
+        return;
+    }
+
+    HWND owner = g_fullscreenOwners[index].hwnd;
+
+    if (!IsFullscreenOwnerOnSameMonitor(owner, monitor)) {
+        g_fullscreenOwners[index] = {};
+        return;
+    }
+
+    // Exact fullscreen geometry is authoritative only for the owner itself.
+    // This function is called from explicit owner lifecycle transitions, not
+    // from every generic refresh triggered by another display.
+    if (GetForegroundWindow() != owner) {
+        return;
+    }
+
+    for (size_t monitorIndex = 0;
+         monitorIndex < monitors.count;
+         ++monitorIndex) {
+        if (monitors.entries[monitorIndex].monitor != monitor) {
+            continue;
+        }
+
+        if (!IsFullscreenWindowForMonitor(
+                owner,
+                monitors.entries[monitorIndex]
+            )) {
+            g_fullscreenOwners[index] = {};
+        }
+        break;
+    }
+}
+
 void ClearInvalidFullscreenWindowCache(
     const MonitorList& monitors
 ) {
-    // Keep fullscreen ownership tied to the actual HMONITOR. An accessibility
-    // or foreground transition on another display must not reassign this state.
+    // General refreshes only retire fullscreen owners when the owning HMONITOR
+    // disappears or the owner is actually moved to another monitor. Do not use
+    // visibility, cloaking, or foreground state here; those transitions are too
+    // noisy during cross-display shell interaction.
     for (size_t i = 0; i < kMaxMonitorNumbers; ++i) {
         if (!g_fullscreenOwners[i].monitor) {
             continue;
         }
 
-        bool monitorStillPresent = false;
+        HMONITOR monitor = g_fullscreenOwners[i].monitor;
+        HWND owner = g_fullscreenOwners[i].hwnd;
 
+        bool monitorStillPresent = false;
         for (size_t monitorIndex = 0;
              monitorIndex < monitors.count;
              ++monitorIndex) {
-            if (monitors.entries[monitorIndex].monitor ==
-                g_fullscreenOwners[i].monitor) {
+            if (monitors.entries[monitorIndex].monitor == monitor) {
                 monitorStillPresent = true;
                 break;
             }
         }
 
         if (!monitorStillPresent ||
-            !g_fullscreenOwners[i].hwnd ||
-            !IsWindow(g_fullscreenOwners[i].hwnd)) {
+            !IsFullscreenOwnerOnSameMonitor(owner, monitor)) {
             g_fullscreenOwners[i] = {};
         }
     }
@@ -1267,11 +1426,12 @@ bool IsForegroundNormalApplication(
 }
 
 void ClearFullscreenOwnerForForegroundApplication(
+    const MonitorList& monitors,
     HWND hwnd
 ) {
-    // A real application becoming foreground means only that application's
-    // monitor has a new foreground owner. Desktop, shell and taskbar
-    // transitions deliberately do not clear fullscreen ownership.
+    // A real application becoming foreground on the same display is an explicit
+    // ownership transition. Shell/desktop/taskbar foreground transitions are
+    // intentionally ignored.
     if (!IsForegroundNormalApplication(hwnd)) {
         return;
     }
@@ -1285,10 +1445,21 @@ void ClearFullscreenOwnerForForegroundApplication(
     const int ownerIndex =
         FindFullscreenOwnerIndex(monitor);
 
-    if (ownerIndex >= 0 &&
-        g_fullscreenOwners[ownerIndex].hwnd != hwnd) {
-        g_fullscreenOwners[ownerIndex] = {};
+    if (ownerIndex < 0 ||
+        g_fullscreenOwners[ownerIndex].hwnd == hwnd) {
+        // If the fullscreen owner itself is foreground, explicitly validate
+        // whether it is still fullscreen before keeping the session alive.
+        ValidateFullscreenOwnerForMonitor(
+            monitor,
+            monitors
+        );
+        return;
     }
+
+    // A different normal application has taken foreground on this same
+    // monitor. Retire the previous fullscreen session. This is deliberately
+    // scoped to the same HMONITOR; activity on another display cannot affect it.
+    g_fullscreenOwners[ownerIndex] = {};
 }
 
 void NoteForegroundFullscreenWindow(
@@ -1296,6 +1467,15 @@ void NoteForegroundFullscreenWindow(
     HWND hwnd
 ) {
     if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+
+    WCHAR className[256] = {};
+    if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) == 0 ||
+        IsDesktopInfrastructureWindow(hwnd, className) ||
+        IsShellChromeClass(className) ||
+        IsShellSurfaceWindow(hwnd, className) ||
+        IsTaskbarWindow(hwnd)) {
         return;
     }
 
@@ -1323,8 +1503,22 @@ void RefreshFullscreenWindowCache(
     // fullscreen ownership. Clicking the desktop or taskbar on another display
     // does not clear the primary display's fullscreen owner.
     ClearFullscreenOwnerForForegroundApplication(
+        monitors,
         foreground
     );
+
+    // Explicitly validate the cached owner only when it is itself foreground.
+    // This is an owner lifecycle check, not a generic cache invalidation pass.
+    if (foreground) {
+        HMONITOR foregroundMonitor = MonitorFromWindow(
+            foreground,
+            MONITOR_DEFAULTTONEAREST
+        );
+        ValidateFullscreenOwnerForMonitor(
+            foregroundMonitor,
+            monitors
+        );
+    }
 
     NoteForegroundFullscreenWindow(
         monitors,
@@ -1697,10 +1891,11 @@ void SetTaskbarState(
 
         if (!(exStyle & WS_EX_LAYERED)) {
             // Another component removed the layering style while the taskbar
-            // was owned by this mod. Drop the stale marker so a later hide can
-            // recapture the taskbar's current state instead of using stale data.
-            RemoveTaskbarOwnershipProperties(state.hwnd);
-            state.hiddenByMod = false;
+            // was owned by this mod. Remove all stale mod-owned style bits before
+            // dropping ownership so the visible taskbar cannot remain click-through.
+            if (DropStaleTaskbarOwnership(state.hwnd, exStyle)) {
+                state.hiddenByMod = false;
+            }
             return;
         }
 
@@ -1723,8 +1918,13 @@ void SetTaskbarState(
 
         if (!(exStyle & WS_EX_LAYERED) ||
             GetPropW(state.hwnd, kTaskbarOwnershipProp) == nullptr) {
-            RemoveTaskbarOwnershipProperties(state.hwnd);
-            state.hiddenByMod = false;
+            if (GetPropW(state.hwnd, kTaskbarOwnershipProp) != nullptr &&
+                DropStaleTaskbarOwnership(state.hwnd, exStyle)) {
+                state.hiddenByMod = false;
+            } else {
+                RemoveTaskbarOwnershipProperties(state.hwnd);
+                state.hiddenByMod = false;
+            }
         } else {
             COLORREF colorKey = 0;
             BYTE alpha = 0;
@@ -2589,10 +2789,6 @@ void CALLBACK WinEventProc(
     if (event == EVENT_SYSTEM_FOREGROUND) {
         MonitorList monitors = GetCurrentMonitors();
         RefreshFullscreenWindowCache(monitors);
-        NoteForegroundFullscreenWindow(
-            monitors,
-            hwnd
-        );
 
         const bool postMinimizeTaskbarForeground =
             g_ignoreTaskbarForegroundAfterMinimize;
@@ -2726,6 +2922,29 @@ void CALLBACK WinEventProc(
 
     if (event == EVENT_SYSTEM_MOVESIZEEND) {
         MonitorList monitors = GetCurrentMonitors();
+
+        if (hwnd) {
+            // If the cached fullscreen owner moved, either keep it on its
+            // original monitor only while it is still there, or retire it.
+            for (size_t i = 0; i < kMaxMonitorNumbers; ++i) {
+                if (g_fullscreenOwners[i].hwnd != hwnd) {
+                    continue;
+                }
+
+                if (!IsFullscreenOwnerOnSameMonitor(
+                        hwnd,
+                        g_fullscreenOwners[i].monitor
+                    )) {
+                    g_fullscreenOwners[i] = {};
+                } else {
+                    ValidateFullscreenOwnerForMonitor(
+                        g_fullscreenOwners[i].monitor,
+                        monitors
+                    );
+                }
+            }
+        }
+
         ClearInvalidFullscreenWindowCache(monitors);
         PostRefresh();
         return;
@@ -2750,10 +2969,9 @@ void CALLBACK WinEventProc(
         }
 
         // Hide/cloak notifications can be transient while a fullscreen browser
-        // changes activation state. Revalidate against the current window state
-        // instead of eagerly discarding the cache from the accessibility event.
-        MonitorList monitors = GetCurrentMonitors();
-        ClearInvalidFullscreenWindowCache(monitors);
+        // changes activation state. They do not end fullscreen ownership. Only
+        // destruction above, explicit minimize completion, move completion, or
+        // an owner-foreground fullscreen-exit validation can retire the session.
         PostRefresh();
     }
 }
